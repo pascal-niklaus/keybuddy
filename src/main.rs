@@ -1,133 +1,209 @@
-use std::fs::OpenOptions;
-use std::io::{Cursor, Read};
-use byteorder::{NativeEndian, ReadBytesExt};
-use input::ffi::libinput_event_pointer_get_axis_value;
+use std::collections::HashMap;
+use std::process::ExitCode;
+use config::{KeyValueData, KeyValueStore};
+use key_tree::{KTree, KeySequence};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
+use std::process::Command;
+use argparse::{ArgumentParser, StoreTrue, Store};
+
+mod key_tree;
 mod key_codes;
 mod xinput;
+mod key_reader;
+mod config;
 
-use crate::key_codes::{RawKeyCode, RawCodes};
-use crate::xinput::XinputEntry;
+use crate::key_reader::{key_device_setup, key_reader_task};
+use crate::key_codes::key_name_from_code;
+use crate::config::init_from_file;
 
-#[repr(u16)]
-#[derive(Clone, Copy)]
-enum EventType {
-    EvSyn      = 0x00,
-    EvKey      = 0x01,
-    EvRel      = 0x02,
-    EvAbs      = 0x03,
-    EvMsc      = 0x04,
-    EvSw       = 0x05,
-    EvLed      = 0x11,
-    EvSnd      = 0x12,
-    EvRep      = 0x14,
-    EvFf       = 0x15,
-    EvPwr      = 0x16,
-    EvFfStatus = 0x17,
-    EvMax      = 0x1f,
-    EvCnt      = 0x20,
+fn exec_gromit(opt: &str) {
+    let _ = Command::new("gromit-mpx")
+        .arg(opt)
+        .output()
+        .expect("gromit-mpx should be found!");
 }
 
-/*
- * value: 0 = release, 1=press, 2=still_pressed (repeat)
- *
- */
+/// clear key queue after timeout
+async fn key_state_machine(mut rx: mpsc::Receiver<u16>) {
 
+    let mut seq : Vec<u16> = vec![];
 
-fn main() {
-    // get all input devices
-    let x = xinput::read_xinput();
-
-    // extract name of keyboard to read from
-    let k : Vec<XinputEntry> = x
-        .into_iter()
-        .filter(|x| x.usb_vid == 1241)
-        .filter(|x| ! x.name.contains("Control"))
-        .collect();
-    eprintln!("{:?}", k);
-
-    // if it is not floating, make it floating
-    //  xinput float id
-
-
-    // open the device file
-    let mut file_options = OpenOptions::new();
-    file_options.read(true);
-    file_options.write(false);
-    let mut dev_file = file_options.open("/dev/keypad_event16").unwrap();
-
-
-    let mut shift_left = false;
-    let mut shift_right = false;
-    let mut ctrl_left = false;
-    let mut ctrl_right = false;
-    let mut alt_left = false;
-    let mut alt_right = false;
-    let mut meta_left = false;
-    let mut meta_right = false;
-    let mut shift = false;
-    let mut alt = false;
-    let mut ctrl = false;
-    let mut meta = false;
+    let mut now = Instant::now();
 
     loop {
-        let mut packet = [0u8; 24];
-        dev_file.read_exact(&mut packet).unwrap();
-
-        let mut rdr = Cursor::new(packet);
-        let tv_sec  = rdr.read_u64::<NativeEndian>().unwrap();
-        let tv_usec = rdr.read_u64::<NativeEndian>().unwrap();
-        let evtype  = rdr.read_u16::<NativeEndian>().unwrap();
-        let code    = rdr.read_u16::<NativeEndian>().unwrap();
-        let value   = rdr.read_i32::<NativeEndian>().unwrap();
-
-        if evtype == EventType::EvKey as u16 {
-            match code {
-                RawCodes::KeyLeftShift  => {
-                    shift_left = value != 0;
-                    shift = shift_left || shift_right
-                },
-                RawCodes::KeyRightShift => {
-                    shift_right = value != 0;
-                    shift = shift_left || shift_right
-                },
-                RawCodes::KeyLeftCtrl  => {
-                    ctrl_left = value != 0;
-                    ctrl = ctrl_left || ctrl_right;
-                },
-                RawCodes::KeyRightCtrl => {
-                    ctrl_right = value != 0;
-                    ctrl = ctrl_left || ctrl_right;
-                },
-                RawCodes::KeyLeftAlt  => {
-                    alt_left = value != 0;
-                    alt = alt_left || alt_right;
-                },
-                RawCodes::KeyRightAlt => {
-                    alt_right = value != 0;
-                    alt = alt_left || alt_right;
-                },
-                RawCodes::KeyLeftMeta  => {
-                    meta_left = value != 0;
-                    meta = meta_left || meta_right;
-                },
-                RawCodes::KeyRightMeta => {
-                    meta_right = value != 0;
-                    meta = meta_left || meta_right;
-                },
-                _ => {
-                    println!("{} {} type={} code={} value={}", tv_sec, tv_usec, evtype, code, value);
-                }
+        if let Some(k) = rx.recv().await {
+            if let Some(name) = key_name_from_code(k) {
+                eprintln!("{} ",name);
+            } else {
+                eprintln!("k={}", k);
             }
-        } else if evtype == EventType::EvSyn as u16 ||
-            evtype == EventType::EvMsc as u16
-        {
-            // discard
-        } else if evtype == EventType::EvLed as u16 {
-            println!("LED={} {}", code, value);
-        }
-        else {
-            println!("{} {} type={} code={} value={} <=", tv_sec, tv_usec, evtype, code, value);
+            if now.elapsed().as_secs() > 2 {
+                seq.clear();
+            }
+            now = Instant::now();
+            seq.push(k);
+
+            // if cmp(&seq, &vec![1, 1, 1]) {
+            //     break;
+            // }
+            // if cmp(&seq, &vec![29]) {
+            //     exec_gromit("-t");
+            //     seq.clear();
+            // }
+            // if cmp(&seq, &vec![56]) {
+            //     exec_gromit("-c");
+            //     seq.clear();
+            // }
+            // if cmp(&seq, &vec![69]) {
+            //     exec_gromit("-v");
+            //     seq.clear();
+            // }
+            eprintln!("seq={:?}", seq);
+
+        } else {
+            break;
         }
     }
+}
+
+#[derive(Debug)]
+struct Options {
+    cfg_file : String,
+    show_keys : bool,
+}
+
+impl Options {
+    pub fn new() -> Self {
+        Self {
+            //cfg_file: "~/.config/keymacros/keymacros.cfg".to_string(),
+            cfg_file: "/data/_programming/keymacros/keymacros/keymacros.conf".to_string(),
+            show_keys: false,
+        }
+    }
+}
+
+fn parse_args() -> Options {
+    let mut opts = Options::new();
+    let k = format!("Name of config file (default: {})", opts.cfg_file);
+    {
+        let mut ap = ArgumentParser::new();
+        ap.set_description("keymacros V0.1 -- (C) 2024 Pascal Niklaus");
+        ap.refer(&mut opts.show_keys)
+            .add_option(&["-k", "--show-key"], StoreTrue, "Show key strokes received");
+        ap.refer(&mut opts.cfg_file)
+            .add_option(&["--config"], Store, k.as_str());
+        ap.parse_args_or_exit();
+    }
+    opts
+}
+
+
+#[tokio::main]
+async fn main() -> ExitCode {
+
+    // command-line arguments
+    let opts = parse_args();
+    eprintln!("{:?}", &opts);
+
+    // read config file
+    let mut kt = KTree::new();
+    let mut kv = KeyValueStore(HashMap::<String, KeyValueData>::new());
+    if let Err(msg) = init_from_file(&opts.cfg_file, &mut kt, &mut kv) {
+        eprintln!("Error: {}", msg);
+    }
+
+    // collect all input devices
+    let mut vid = None;
+    if let Some(KeyValueData::Int(v)) = kv.get("vid") {
+        vid = Some(v as u16);
+    }
+    let mut pid = None;
+    if let Some(KeyValueData::Int(v)) = kv.get("pid") {
+        pid = Some(v as u16);
+    }
+
+    // filter devices, make the one found float, and extracts its name
+    let dev_name = key_device_setup(vid, pid);
+    if let Err(err) = dev_name {
+        eprintln!("An error occurred: {}", err);
+        return ExitCode::FAILURE;
+    }
+    let dev_name = dev_name.unwrap().to_string();
+
+    // communication channels
+    let (ev_tx, mut ev_rx) = mpsc::channel::<u16>(10);
+    let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+
+    // spawn keystroke reader
+    let task_handle = tokio::spawn(async move {
+        key_reader_task(&dev_name, ev_tx, stop_rx).await;
+    });
+
+
+    // show key strokes
+    if opts.show_keys {
+        eprintln!("Showing codes of key strokes received (Ctrl-C to abort)");
+        while let Some(k) = ev_rx.recv().await {
+            if let Some(name) = key_name_from_code(k) {
+                eprint!("{} ",name);
+            } else {
+                eprint!("{}", k);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+
+    {
+        let mut seq : Vec<u16> = vec![];
+        let mut now = Instant::now();
+
+        loop {
+            if let Some(k) = ev_rx.recv().await {
+                if let Some(name) = key_name_from_code(k) {
+                    eprintln!("{} ",name);
+                } else {
+                    eprintln!("k={}", k);
+                }
+                if now.elapsed().as_secs() > 2 {
+                    seq.clear();
+                }
+                now = Instant::now();
+                seq.push(k);
+
+                // if cmp(&seq, &vec![1, 1, 1]) {
+                //     break;
+                // }
+                // if cmp(&seq, &vec![29]) {
+                //     exec_gromit("-t");
+                //     seq.clear();
+                // }
+                // if cmp(&seq, &vec![56]) {
+                //     exec_gromit("-c");
+                //     seq.clear();
+                // }
+                // if cmp(&seq, &vec![69]) {
+                //     exec_gromit("-v");
+                //     seq.clear();
+                // }
+                eprintln!("seq={:?}", seq);
+
+            } else {
+                break;
+            }
+        }
+    }
+    /// spawn key
+    // let key_handle = tokio::spawn(async move {
+    //     key_state_machine(ev_rx).await;
+    // });
+
+    // key_handle.await.unwrap();
+
+    stop_tx.send(()).await.unwrap();
+    task_handle.await.unwrap();
+
+    ExitCode::SUCCESS
 }
