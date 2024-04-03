@@ -1,8 +1,16 @@
+//! interface to xinput command-line tool
+//!
+//! An interface through some library would be nicer, but I don't have
+//! the time to do this...
+
 use std::process::Command;
 use std::str;
 use regex::Regex;
 use std::sync::OnceLock;
+use anyhow::{Result, Context, bail};
 
+/// collected information for devices listed by `xinput`
+///
 #[derive(Debug, Clone)]
 pub struct XinputEntry {
     pub name: String,
@@ -42,7 +50,9 @@ impl XinputEntry {
     }
 }
 
-pub fn read_xinput() -> Vec<XinputEntry> {
+/// collect infos about all devices listed by xinput
+///
+pub fn read_xinput() -> Result<Vec<XinputEntry>> {
     let mut result = vec![];
 
     static RX1: OnceLock<Regex> = OnceLock::new();
@@ -55,11 +65,11 @@ pub fn read_xinput() -> Vec<XinputEntry> {
         || Regex::new(r##"^\s*Device Product ID.+:\s*(?<vid>[0-9]+)\s*,\s*(?<pid>[0-9]+)"##).unwrap()
     );
 
-    // collect lines output by xinput --list
+    // collect lines printed by `xinput --list`
     let output = Command::new("xinput")
         .arg("-list")
         .output()
-        .expect("failed to execute process");
+        .context("running 'xinput -list'")?;
 
     if output.status.success() {
         if let Ok(out) = str::from_utf8(&output.stdout) {
@@ -69,28 +79,28 @@ pub fn read_xinput() -> Vec<XinputEntry> {
                     let output = Command::new("xinput")
                         .arg("--list-props")
                         .arg(x.id.to_string())
-                         .output()
-                        .expect("get props failed");
+                        .output()
+                        .context("running 'xinput --list-props'")?;
                     if output.status.success() {
-                        if let Ok(out) = str::from_utf8(&output.stdout) {
-                            for line in out.lines() {
-                                if let Some(caps) = rx1.captures(line) {
-                                    x.device = caps["name"].to_string();
-                                } else if let Some(caps) = rx2.captures(line) {
-                                    x.usb_vid = caps["vid"].parse::<u16>().unwrap_or(0);
-                                    x.usb_pid = caps["pid"].parse::<u16>().unwrap_or(0);
-                                }
+                        let out = str::from_utf8(&output.stdout)
+                            .context("converting 'xinput' output to utf-8")?;
+                        for line in out.lines() {
+                            if let Some(caps) = rx1.captures(line) {
+                                x.device = caps["name"].to_string();
+                            } else if let Some(caps) = rx2.captures(line) {
+                                x.usb_vid = caps["vid"].parse::<u16>().unwrap_or(0);
+                                x.usb_pid = caps["pid"].parse::<u16>().unwrap_or(0);
                             }
                         }
                     }
                     result.push(x.clone());
                 } else {
-                    eprintln!("Cannot parse line <{}>", line);
+                    bail!("Parsing line <{}>", line);
                 }
             }
         }
     } else {
-        eprintln!("Failure running 'xlist'");
+        bail!("Cound not run 'xlist'");
     }
-    return result;
+    Ok(result)
 }

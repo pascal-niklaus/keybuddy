@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
-use config::{KeyValueData, KeyValueStore};
-use key_tree::{KTree, KeySequence};
+use std::process::Command;
+
+use clap::Parser;
+use anyhow::{Result, Context};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-
-use std::process::Command;
-use argparse::{ArgumentParser, StoreTrue, Store};
 
 mod key_tree;
 mod key_codes;
@@ -14,104 +13,62 @@ mod xinput;
 mod key_reader;
 mod config;
 
-use crate::key_reader::{key_device_setup, key_reader_task};
-use crate::key_codes::key_name_from_code;
-use crate::config::init_from_file;
+use config::{KeyValueData, KeyValueStore};
 
-fn exec_gromit(opt: &str) {
-    let _ = Command::new("gromit-mpx")
-        .arg(opt)
-        .output()
-        .expect("gromit-mpx should be found!");
-}
+use key_reader::{key_device_setup, key_reader_task};
+use key_codes::key_name_from_code;
+use key_tree::{KTree, KeySequence};
+use config::init_from_file;
 
-/// clear key queue after timeout
-async fn key_state_machine(mut rx: mpsc::Receiver<u16>) {
-
-    let mut seq : Vec<u16> = vec![];
-
-    let mut now = Instant::now();
-
-    loop {
-        if let Some(k) = rx.recv().await {
-            if let Some(name) = key_name_from_code(k) {
-                eprintln!("{} ",name);
-            } else {
-                eprintln!("k={}", k);
-            }
-            if now.elapsed().as_secs() > 2 {
-                seq.clear();
-            }
-            now = Instant::now();
-            seq.push(k);
-
-            // if cmp(&seq, &vec![1, 1, 1]) {
-            //     break;
-            // }
-            // if cmp(&seq, &vec![29]) {
-            //     exec_gromit("-t");
-            //     seq.clear();
-            // }
-            // if cmp(&seq, &vec![56]) {
-            //     exec_gromit("-c");
-            //     seq.clear();
-            // }
-            // if cmp(&seq, &vec![69]) {
-            //     exec_gromit("-v");
-            //     seq.clear();
-            // }
-            eprintln!("seq={:?}", seq);
-
-        } else {
-            break;
+/// Execute a command and return true if ok, otherwise false
+///
+/// The command is passed as single str including all the arguments.
+///
+fn exec_command(cmd: &str) -> bool {
+    if let Some(parts) = shlex::split(cmd) {
+        if let Some((cmd, args)) = parts.split_first() {
+            return Command::new(cmd).args(args).output().is_ok()
         }
     }
+    false
 }
 
-#[derive(Debug)]
-struct Options {
-    cfg_file : String,
-    show_keys : bool,
-}
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+#[command(about = "KeyBuddy -- keystroke interpreter for separate keypad\n(C) 2024 Pascal Niklaus", long_about = None)]
+struct Args {
+    /// Show key strokes received
+    #[arg(short='k', long="show-keys", default_value_t  = false)]
+    show_keys: bool,
 
-impl Options {
-    pub fn new() -> Self {
-        Self {
-            //cfg_file: "~/.config/keymacros/keymacros.cfg".to_string(),
-            cfg_file: "/data/_programming/keymacros/keymacros/keymacros.conf".to_string(),
-            show_keys: false,
-        }
-    }
-}
+    /// Set maximum time span between keystrokes that form a sequence
+    #[arg(short='d', long="delay", id="SECONDS", default_value_t = 2.0)]
+    key_memory_span: f32,
 
-fn parse_args() -> Options {
-    let mut opts = Options::new();
-    let k = format!("Name of config file (default: {})", opts.cfg_file);
-    {
-        let mut ap = ArgumentParser::new();
-        ap.set_description("keymacros V0.1 -- (C) 2024 Pascal Niklaus");
-        ap.refer(&mut opts.show_keys)
-            .add_option(&["-k", "--show-key"], StoreTrue, "Show key strokes received");
-        ap.refer(&mut opts.cfg_file)
-            .add_option(&["--config"], Store, k.as_str());
-        ap.parse_args_or_exit();
-    }
-    opts
+    /// Use config file
+    #[arg(long, default_value_t = std::env::var("HOME").unwrap()+"/.config/keybuddy.conf")]
+    cfg_file: String,
+
+    /// Be verbose (for debugging)
+    #[arg(short='v', long="verbose", default_value_t = false)]
+    debug: bool,
 }
 
 
 #[tokio::main]
-async fn main() -> ExitCode {
-
+async fn main() -> Result<ExitCode> {
     // command-line arguments
-    let opts = parse_args();
-    eprintln!("{:?}", &opts);
+    let mut opts = Args::parse();
+
+    eprintln!("KeyBuddy -- (C) 2024 Pascal Niklaus");
 
     // read config file
     let mut kt = KTree::new();
     let mut kv = KeyValueStore(HashMap::<String, KeyValueData>::new());
-    if let Err(msg) = init_from_file(&opts.cfg_file, &mut kt, &mut kv) {
-        eprintln!("Error: {}", msg);
+    init_from_file(&opts.cfg_file, &mut kt, &mut kv).context("Reading config file")?;
+
+    if let Some(delay) = kv.get_float("delay") {
+        opts.key_memory_span = delay;
     }
 
     // collect all input devices
@@ -123,12 +80,20 @@ async fn main() -> ExitCode {
     if let Some(KeyValueData::Int(v)) = kv.get("pid") {
         pid = Some(v as u16);
     }
+    let mut f1 : Box<dyn Fn(&str)->bool> = Box::new(|_x: &str| -> bool { true });
+    let mut f2 : Box<dyn Fn(&str)->bool> = Box::new(|_x: &str| -> bool { true });
+    if let Some(KeyValueData::Text(v)) = kv.get("device_include") {
+        f1 = Box::new(move |x: &str| -> bool { x.contains(v.as_str()) });
+    }
+    if let Some(KeyValueData::Text(v)) = kv.get("device_exclude") {
+        f2 = Box::new(move |x: &str| -> bool { !x.contains(v.as_str()) });
+    }
 
     // filter devices, make the one found float, and extracts its name
-    let dev_name = key_device_setup(vid, pid);
+    let dev_name = key_device_setup(vid, pid, Some(Box::new(move |x| { f1(x) & f2(x) })));
     if let Err(err) = dev_name {
         eprintln!("An error occurred: {}", err);
-        return ExitCode::FAILURE;
+        return Ok(ExitCode::FAILURE);
     }
     let dev_name = dev_name.unwrap().to_string();
 
@@ -141,7 +106,6 @@ async fn main() -> ExitCode {
         key_reader_task(&dev_name, ev_tx, stop_rx).await;
     });
 
-
     // show key strokes
     if opts.show_keys {
         eprintln!("Showing codes of key strokes received (Ctrl-C to abort)");
@@ -152,58 +116,61 @@ async fn main() -> ExitCode {
                 eprint!("{}", k);
             }
         }
-        return ExitCode::SUCCESS;
+        return Ok(ExitCode::SUCCESS);
     }
-
 
     {
         let mut seq : Vec<u16> = vec![];
         let mut now = Instant::now();
+        let quit = kv.get_str("quit_command");
 
+        if opts.debug {
+            kt.dump();
+        }
+
+        let mut newline = true;
         loop {
             if let Some(k) = ev_rx.recv().await {
-                if let Some(name) = key_name_from_code(k) {
-                    eprintln!("{} ",name);
-                } else {
-                    eprintln!("k={}", k);
-                }
-                if now.elapsed().as_secs() > 2 {
+                if now.elapsed().as_secs_f32() > opts.key_memory_span && !newline {
                     seq.clear();
+                    if opts.debug {
+                        eprintln!("... aborted");
+                    }
+                }
+                if opts.debug {
+                    if let Some(name) = key_name_from_code(k) {
+                        eprint!("{} ",name);
+                    } else {
+                        eprint!("k={}", k);
+                    }
                 }
                 now = Instant::now();
                 seq.push(k);
 
-                // if cmp(&seq, &vec![1, 1, 1]) {
-                //     break;
-                // }
-                // if cmp(&seq, &vec![29]) {
-                //     exec_gromit("-t");
-                //     seq.clear();
-                // }
-                // if cmp(&seq, &vec![56]) {
-                //     exec_gromit("-c");
-                //     seq.clear();
-                // }
-                // if cmp(&seq, &vec![69]) {
-                //     exec_gromit("-v");
-                //     seq.clear();
-                // }
-                eprintln!("seq={:?}", seq);
-
+                if let Some(cmd) = kt.find(&KeySequence::from(&seq)) {
+                    if quit.is_some() && cmd == quit.unwrap() {
+                        if opts.debug {
+                            eprintln!("-> exiting...");
+                        }
+                        break;
+                    }
+                    if opts.debug {
+                        eprintln!("-> executing <{}>", cmd);
+                    }
+                    exec_command(cmd);
+                    seq.clear();
+                    newline = true;
+                } else {
+                    newline = false;
+                }
             } else {
                 break;
             }
         }
     }
-    /// spawn key
-    // let key_handle = tokio::spawn(async move {
-    //     key_state_machine(ev_rx).await;
-    // });
-
-    // key_handle.await.unwrap();
 
     stop_tx.send(()).await.unwrap();
     task_handle.await.unwrap();
 
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }

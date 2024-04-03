@@ -5,24 +5,33 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Key codes for "modifier" keys like Shift, Alt etc
+///
+/// These are stored as pub const so that they can easily be used as
+/// simple u16
+#[allow(dead_code)]
 pub struct RawCodes {}
 
+#[allow(dead_code)]
 impl RawCodes {
-    pub const KeyLeftShift : u16 = 42;
-    pub const KeyRightShift : u16 = 54;
-    pub const KeyRightCtrl : u16 = 97;
-    pub const KeyLeftCtrl : u16 = 29;
-    pub const KeyLeftAlt : u16 = 56;
-    pub const KeyRightAlt : u16 = 100;
-    pub const KeyLeftMeta : u16 = 125;
-    pub const KeyRightMeta : u16 = 126;
-    pub const KeyCompose : u16 = 127;
+    pub const KEY_LEFT_SHIFT : u16 = 42;
+    pub const KEY_RIGHT_SHIFT : u16 = 54;
+    pub const KEY_RIGHT_CTRL : u16 = 97;
+    pub const KEY_LEFT_CTRL : u16 = 29;
+    pub const KEY_LEFT_ALT : u16 = 56;
+    pub const KEY_RIGHT_ALT : u16 = 100;
+    pub const KEY_LEFT_META : u16 = 125;
+    pub const KEY_RIGHT_META : u16 = 126;
+    pub const KEY_COMPOSE : u16 = 127;
 }
 
-/// event types returned when reading from /dev/input/eventX
-/// devices. Important are mostly EvKey, EvLev, EvMsc, and EvSyn.
+/// Event types returned when reading from /dev/input/eventX
+/// devices.
+///
+/// These can be downcast to u16 values.
+/// Important are mostly EvKey, EvLev, EvMsc, and EvSyn.
 #[repr(u16)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub enum EventType {
     EvSyn      = 0x00,
     EvKey      = 0x01,
@@ -40,9 +49,12 @@ pub enum EventType {
     EvCnt      = 0x20,
 }
 
-/// get a code from a textual representation of a key code. The names
-/// are the #define statements in
-/// /usr/include/linux/input-event-codes.h
+/// Get key code given key name
+///
+/// The names are the #define
+/// statements in /usr/include/linux/input-event-codes.h
+///
+/// Example of a name: KEY_KP0
 pub fn code_from_key_name(name: &str) -> Option<u16> {
     static STORE: OnceLock<HashMap<&str, u16>> = OnceLock::new();
     let hash = STORE.get_or_init(
@@ -57,7 +69,7 @@ pub fn code_from_key_name(name: &str) -> Option<u16> {
     hash.get(name).copied()
 }
 
-/// get a key name given the code.
+/// Get a key name given the key code
 pub fn key_name_from_code(code: u16) -> Option<&'static str> {
     static STORE: OnceLock<HashMap<u16, &str>> = OnceLock::new();
     let hash = STORE.get_or_init(
@@ -72,9 +84,12 @@ pub fn key_name_from_code(code: u16) -> Option<&'static str> {
     hash.get(&code).copied()
 }
 
-
-/// names and values from /usr/include/linux/input-event-codes.h
-static KEYCODES: [(&str, u16); 487] =
+/// Key names and values from /usr/include/linux/input-event-codes.h
+///
+/// This list contains some pretty unusual keys...
+///
+/// Redundant codes have been removed
+static KEYCODES: [(&str, u16); 486] =
     [("KEY_ESC", 1),
      ("KEY_1", 2),
      ("KEY_2", 3),
@@ -561,5 +576,4 @@ static KEYCODES: [(&str, u16); 487] =
      ("KEY_KBD_LCD_MENU3", 0x2ba),
      ("KEY_KBD_LCD_MENU4", 0x2bb),
      ("KEY_KBD_LCD_MENU5", 0x2bc),
-     ("KEY_MAX", 0x2ff),
     ];
